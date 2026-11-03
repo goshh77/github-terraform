@@ -1,0 +1,39 @@
+name: Terraform init (GCP)
+description: Authenticate to GCP with Workload Identity Federation, install Terraform and run terraform init for an environment.
+
+inputs:
+  environment:
+    description: Environment folder under environments/ (e.g. dev)
+    required: true
+  workload_identity_provider:
+    description: Full WIF provider resource name
+    required: true
+  service_account:
+    description: Service account email Terraform runs as
+    required: true
+  terraform_version:
+    description: Terraform CLI version
+    required: false
+    default: "1.17.1"
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to Google Cloud (keyless OIDC)
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Terraform init
+      shell: bash
+      working-directory: terraform
+      run: |
+        terraform init -input=false \
+          -backend-config="../environments/${{ inputs.environment }}/backend.hcl"

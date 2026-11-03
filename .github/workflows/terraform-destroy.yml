@@ -1,0 +1,92 @@
+# Manual teardown: preview the destroy plan, then wait for approval before destroying.
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        type: choice
+        options: [dev]
+        default: dev
+      confirm:
+        description: Type DESTROY to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ENVIRONMENT: ${{ inputs.environment }}
+
+concurrency:
+  group: tf-apply-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  plan-destroy:
+    name: Destroy plan (${{ inputs.environment }})
+    if: inputs.confirm == 'DESTROY'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ env.ENVIRONMENT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform plan -destroy
+        working-directory: terraform
+        run: |
+          terraform plan -destroy -no-color -lock-timeout=5m \
+            -var-file="../environments/${ENVIRONMENT}/terraform.tfvars" \
+            -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo "## ⚠️ Destroy plan — \`${ENVIRONMENT}\`"
+            echo '```'
+            grep -E '^Plan:' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tfdestroy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: |
+            terraform/tfplan
+            terraform/.terraform.lock.hcl
+          include-hidden-files: true # keep the provider lock file with the plan
+          retention-days: 1
+
+  destroy:
+    name: Destroy (${{ inputs.environment }})
+    needs: plan-destroy
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tfdestroy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: terraform
+
+      - uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ env.ENVIRONMENT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform apply (destroy plan)
+        working-directory: terraform
+        run: terraform apply -no-color -lock-timeout=5m -auto-approve tfplan

@@ -1,0 +1,134 @@
+# PREVIEW -> APPLY on main.
+#   1. `plan` job: creates a saved plan file and shows it in the run summary.
+#   2. `apply` job: pauses on the GitHub Environment approval gate, then applies
+#      EXACTLY the saved plan from step 1 (no re-plan, no surprises).
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "environments/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        type: choice
+        options: [dev]
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+
+# Never run two applies against the same state at once; queue instead of cancelling.
+concurrency:
+  group: tf-apply-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan (${{ inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ env.ENVIRONMENT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform plan
+        id: plan
+        working-directory: terraform
+        run: |
+          set +e
+          terraform plan -no-color -lock-timeout=5m \
+            -var-file="../environments/${ENVIRONMENT}/terraform.tfvars" \
+            -out=tfplan -detailed-exitcode
+          ec=$?
+          set -e
+          [ "$ec" -eq 1 ] && exit 1
+          if [ "$ec" -eq 2 ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Plan summary (review this before approving)
+        working-directory: terraform
+        run: |
+          {
+            echo "## Terraform plan — \`${ENVIRONMENT}\`"
+            echo ""
+            echo "Approve the **apply** job only if this plan looks right."
+            echo ""
+            echo '<details><summary>Full plan</summary>'
+            echo ""
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo '```'
+            echo '</details>'
+            echo ""
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload saved plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: |
+            terraform/tfplan
+            terraform/.terraform.lock.hcl
+          include-hidden-files: true # keep the provider lock file with the plan
+          retention-days: 3 # plan files can contain sensitive values
+
+  apply:
+    name: Apply (${{ inputs.environment || 'dev' }})
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    # Configure "Required reviewers" on this environment in
+    # Settings -> Environments so the job waits for a human approval.
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download saved plan
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: terraform
+
+      - uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ env.ENVIRONMENT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform apply (saved plan)
+        working-directory: terraform
+        run: terraform apply -no-color -lock-timeout=5m -auto-approve tfplan
+
+      - name: Outputs
+        working-directory: terraform
+        run: |
+          {
+            echo "## Deployed \`${ENVIRONMENT}\`"
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,147 @@
+# PREVIEW: runs on every pull request to main.
+# Lints + validates the code, runs `terraform plan` and posts the plan as a PR comment.
+# Nothing is changed in GCP here.
+name: Terraform Plan (PR preview)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "environments/**"
+      - ".github/workflows/**"
+      - ".github/actions/**"
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for Workload Identity Federation
+  pull-requests: write # post the plan as a comment
+
+concurrency:
+  group: tf-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  validate:
+    name: Format, validate & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+      - uses: terraform-linters/setup-tflint@v6
+
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev] # add stage / prod here when you create environments/<env>
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/terraform-init
+        with:
+          environment: ${{ matrix.environment }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform plan
+        id: plan
+        working-directory: terraform
+        run: |
+          set +e
+          terraform plan -no-color -lock-timeout=5m \
+            -var-file="../environments/${{ matrix.environment }}/terraform.tfvars" \
+            -out=tfplan -detailed-exitcode
+          ec=$?
+          set -e
+          echo "exitcode=$ec" >> "$GITHUB_OUTPUT"
+          [ "$ec" -eq 1 ] && exit 1
+          terraform show -no-color tfplan > plan.txt
+          exit 0
+
+      - name: Job summary
+        working-directory: terraform
+        run: |
+          {
+            echo "## Terraform plan — \`${{ matrix.environment }}\`"
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v9
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            let plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const max = 60000;
+            if (plan.length > max) {
+              plan = plan.substring(plan.length - max);
+              plan = '... (truncated, see the workflow run for the full plan)\n' + plan;
+            }
+            const marker = `<!-- tf-plan-${env} -->`;
+            const status = process.env.EXITCODE === '2' ? '🟡 changes pending' : '🟢 no changes';
+            const body = [
+              marker,
+              `### Terraform plan for \`${env}\` — ${status}`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              `*Commit ${context.payload.pull_request.head.sha.substring(0, 7)} · merging to \`main\` re-plans and waits for approval before apply.*`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
