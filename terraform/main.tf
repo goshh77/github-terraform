@@ -43,7 +43,7 @@ module "iam" {
   service_accounts = {
     "${local.name}-app-vm" = {
       display_name = "App VM (${var.environment})"
-      roles        = [
+      roles = [
         "roles/logging.logWriter",
         "roles/monitoring.metricWriter",
         "roles/cloudsql.client",
@@ -51,7 +51,7 @@ module "iam" {
     }
     "${local.name}-web-mig" = {
       display_name = "Web MIG instances (${var.environment})"
-      roles        = [
+      roles = [
         "roles/logging.logWriter",
         "roles/monitoring.metricWriter",
       ]
