@@ -28,7 +28,7 @@ deletion_protection = false
 
 # Who can SSH to private VMs through IAP. Example:
 # iap_ssh_members = ["user:harsha@example.com"]
-iap_ssh_members = []
+iap_ssh_members = ["user:harsha_c2k4@gmail.com"]
 
 labels = {
   owner = "harsha"
